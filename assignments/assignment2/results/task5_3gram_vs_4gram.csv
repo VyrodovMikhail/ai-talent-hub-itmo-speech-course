@@ -1,0 +1,3 @@
+name,method,lm_model_path,libri_wer,libri_cer
+SF-3gram,beam_lm,lm/3-gram.pruned.1e-7.arpa.gz,0.10975311659740894,0.03740128869725304
+SF-4gram,beam_lm,lm/4-gram.arpa,0.11024199462234173,0.037498183227556804

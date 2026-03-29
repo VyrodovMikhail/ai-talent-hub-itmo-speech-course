@@ -54,6 +54,7 @@ class Wav2Vec2Decoder:
         self.vocab = {i: c for c, i in self.processor.tokenizer.get_vocab().items()}
         self.blank_token_id = self.processor.tokenizer.pad_token_id
         self.word_delimiter = self.processor.tokenizer.word_delimiter_token
+        self.word_delimeter_id = self.processor.tokenizer.word_delimiter_token_id
         self.beam_width = beam_width
         self.alpha = alpha
         self.beta = beta
@@ -83,8 +84,18 @@ class Wav2Vec2Decoder:
         Returns:
             str: Decoded transcript.
         """
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+        log_probs = torch.log_softmax(logits, dim=-1)
+        tokens = torch.argmax(log_probs, dim=-1).tolist()
+
+        # CTC collapsing: remove consecutive duplicates, then remove blanks
+        result = []
+        prev = None
+        for t in tokens:
+            if t != prev and t != self.blank_token_id:
+                result.append(t)
+            prev = t
+
+        return self._ids_to_text(result)
 
     def beam_search_decode(self, logits: torch.Tensor, return_beams: bool = False):
         """
@@ -103,10 +114,80 @@ class Wav2Vec2Decoder:
                 List[Tuple[List[int], float]] - list of (token_ids, log_prob)
                     tuples sorted best-first (if return_beams=True).
         """
-        # <YOUR CODE GOES HERE>
+        log_probs = torch.log_softmax(logits, dim=-1)
+        T, V = log_probs.shape
+        blank = self.blank_token_id
+        NEG_INF = float('-inf')
+
+        # beams: decoded_tuple -> [pb, pnb]
+        # prob_ends_with_blank  = log prob of all paths yielding this prefix that end with blank
+        # prob_ends_with_char = log prob of all paths yielding this prefix that end with non-blank
+        beams = {(): [0.0, NEG_INF]}  # empty prefix, prob 1 ending in blank
+
+        for t in range(T):
+            current_log_probs = log_probs[t]  # (V,)
+            new_beams: dict = {}
+
+            for decoded, (prob_ends_with_blank, prob_ends_with_char) in beams.items():
+                total = _log_add(prob_ends_with_blank, prob_ends_with_char)
+
+                # Add blank token and compute log probability
+                if decoded not in new_beams:
+                    new_beams[decoded] = [NEG_INF, NEG_INF]
+                new_beams[decoded][0] = _log_add(
+                    new_beams[decoded][0], total + current_log_probs[blank].item()
+                )
+
+                # Emit each non-blank token
+                for c in range(V):
+                    if c == blank:
+                        continue
+                    char_log_prob = current_log_probs[c].item()
+
+                    if not decoded or c != decoded[-1]:
+                        # Different from last: extend prefix
+                        new_sequence = decoded + (c,)
+                        if new_sequence not in new_beams:
+                            new_beams[new_sequence] = [NEG_INF, NEG_INF]
+                        new_beams[new_sequence][1] = _log_add(
+                            new_beams[new_sequence][1], total + char_log_prob
+                        )
+                    else:
+                        # Same as last character of decoded — two sub-cases:
+                        # (a) path ended in blank: adds a new (repeated) char
+                        new_sequence = decoded + (c,)
+                        if new_sequence not in new_beams:
+                            new_beams[new_sequence] = [NEG_INF, NEG_INF]
+                        new_beams[new_sequence][1] = _log_add(
+                            new_beams[new_sequence][1], prob_ends_with_blank + char_log_prob
+                        )
+                        # (b) path ended in non-blank: repeating char, stays same prefix
+                        if decoded not in new_beams:
+                            new_beams[decoded] = [NEG_INF, NEG_INF]
+                        new_beams[decoded][1] = _log_add(
+                            new_beams[decoded][1], prob_ends_with_char + char_log_prob
+                        )
+
+            # Prune to beam_width by total acoustic score
+            beams = dict(
+                sorted(
+                    new_beams.items(),
+                    key=lambda x: _log_add(x[1][0], x[1][1]),
+                    reverse=True,
+                )[:self.beam_width]
+            )
+
+        # Sort final beams best-first
+        scored = sorted(
+            beams.items(),
+            key=lambda x: _log_add(x[1][0], x[1][1]),
+            reverse=True,
+        )
+
         if return_beams:
-            raise NotImplementedError
-        raise NotImplementedError
+            return [(list(decoded_seq), _log_add(prob_ends_with_blank, prob_ends_with_char)) for decoded_seq, (prob_ends_with_blank, prob_ends_with_char) in scored]
+
+        return self._ids_to_text(list(scored[0][0]))
 
     def beam_search_with_lm(self, logits: torch.Tensor) -> str:
         """
@@ -122,8 +203,108 @@ class Wav2Vec2Decoder:
         """
         if not self.lm_model:
             raise ValueError("KenLM model required for LM shallow fusion")
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        T, V = log_probs.shape
+        blank = self.blank_token_id
+        NEG_INF = float('-inf')
+
+        # Acoustic beams: decoded_tuple -> [pb, pnb]
+        acoustics_beams = {(): [0.0, NEG_INF]}
+
+        # LM data cache: decoded_tuple -> (kenlm_state, lm_log_prob, word_count)
+        # lm_log_prob: accumulated LM log-prob in natural log units
+        init_lm_state = kenlm.State()
+        self.lm_model.BeginSentenceWrite(init_lm_state)
+        lm_data: dict = {(): (init_lm_state, 0.0, 0)}
+
+        def ensure_lm(decoded: tuple, c: int) -> None:
+            """Populate lm_data for decoded+(c,) from parent decoded's LM state."""
+            new_sequence = decoded + (c,)
+            if new_sequence in lm_data:
+                return
+            parent_state, parent_score, parent_word_count = lm_data[decoded]
+            if c == self.word_delimeter_id:
+                # A word delimiter was just appended — score the completed word
+                chars = []
+                for tok in reversed(decoded):
+                    if tok == self.word_delimeter_id:
+                        break
+                    chars.append(self.vocab[tok])
+                word = ''.join(reversed(chars)).lower()
+                if word:
+                    out_state = kenlm.State()
+                    log10_p = self.lm_model.BaseScore(parent_state, word, out_state)
+                    lm_data[new_sequence] = (out_state, parent_score + log10_p * math.log(10), parent_word_count + 1)
+                else:
+                    lm_data[new_sequence] = (parent_state, parent_score, parent_word_count)
+            else:
+                lm_data[new_sequence] = (parent_state, parent_score, parent_word_count)
+
+        def combined_score(decoded: tuple, pb: float, pnb: float) -> float:
+            _, lm_s, wc = lm_data[decoded]
+            return _log_add(pb, pnb) + self.alpha * lm_s + self.beta * wc
+
+        for t in range(T):
+            lp = log_probs[t]
+            new_ac: dict = {}
+
+            for decoded, (pb, pnb) in acoustics_beams.items():
+                total = _log_add(pb, pnb)
+
+                # Emit blank — prefix unchanged
+                if decoded not in new_ac:
+                    new_ac[decoded] = [NEG_INF, NEG_INF]
+                new_ac[decoded][0] = _log_add(
+                    new_ac[decoded][0], total + lp[blank].item()
+                )
+
+                # Emit each non-blank token
+                for c in range(V):
+                    if c == blank:
+                        continue
+                    c_lp = lp[c].item()
+
+                    if not decoded or c != decoded[-1]:
+                        nd = decoded + (c,)
+                        ensure_lm(decoded, c)
+                        if nd not in new_ac:
+                            new_ac[nd] = [NEG_INF, NEG_INF]
+                        new_ac[nd][1] = _log_add(new_ac[nd][1], total + c_lp)
+                    else:
+                        # (a) was after blank: new repeated char
+                        nd = decoded + (c,)
+                        ensure_lm(decoded, c)
+                        if nd not in new_ac:
+                            new_ac[nd] = [NEG_INF, NEG_INF]
+                        new_ac[nd][1] = _log_add(new_ac[nd][1], pb + c_lp)
+                        # (b) repeat non-blank: prefix stays
+                        if decoded not in new_ac:
+                            new_ac[decoded] = [NEG_INF, NEG_INF]
+                        new_ac[decoded][1] = _log_add(
+                            new_ac[decoded][1], pnb + c_lp
+                        )
+
+            # Prune by combined score
+            beams_list = sorted(
+                new_ac.items(),
+                key=lambda x: combined_score(x[0], x[1][0], x[1][1]),
+                reverse=True,
+            )
+            acoustics_beams = dict(beams_list[:self.beam_width])
+
+        # Final: use full-sentence KenLM scoring so the final shallow-fusion
+        # decision matches the same BOS/EOS convention used in rescoring.
+        final_scored = []
+        for decoded, (pb, pnb) in acoustics_beams.items():
+            text = self._ids_to_text(list(decoded))
+            wc = len(text.split())
+            lm_s = self.lm_model.score(text, bos=True, eos=True) * math.log(10)
+            score = _log_add(pb, pnb) + self.alpha * lm_s + self.beta * wc
+            final_scored.append((decoded, score))
+
+        final_scored.sort(key=lambda x: x[1], reverse=True)
+        return self._ids_to_text(list(final_scored[0][0]))
 
     def lm_rescore(self, beams: List[Tuple[List[int], float]]) -> str:
         """
@@ -138,8 +319,21 @@ class Wav2Vec2Decoder:
         """
         if not self.lm_model:
             raise ValueError("KenLM model required for LM rescoring")
-        # <YOUR CODE GOES HERE>
-        raise NotImplementedError
+
+        best_score = float('-inf')
+        best_text = ""
+
+        for token_ids, acoustic_score in beams:
+            text = self._ids_to_text(token_ids)
+            word_count = len(text.split())
+            # KenLM returns log10 prob; convert to natural log for consistent units
+            lm_score = self.lm_model.score(text, bos=True, eos=True) * math.log(10)
+            combined = acoustic_score + self.alpha * lm_score + self.beta * word_count
+            if combined > best_score:
+                best_score = combined
+                best_text = text
+
+        return best_text
 
     # -----------------------------------------------------------------------
     # Provided — do NOT modify
@@ -225,7 +419,7 @@ if __name__ == "__main__":
         ("examples/sample8.wav", "operating surplus is a non cap financial measure which is defined as fully in our press release"),
     ]
 
-    decoder = Wav2Vec2Decoder(lm_model_path=None)  # set lm_model_path for Tasks 4+
+    decoder = Wav2Vec2Decoder(lm_model_path="lm/3-gram.pruned.1e-7.arpa.gz")  # set lm_model_path for Tasks 4+
 
     for audio_path, reference in test_samples:
         test(decoder, audio_path, reference)

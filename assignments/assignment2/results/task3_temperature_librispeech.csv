@@ -1,0 +1,7 @@
+manifest,method,temperature,alpha,beta,wer,cer
+data/librispeech_test_other/manifest.csv,greedy,0.5,0.0,0.0,0.11219750672207285,0.038127997674531275
+data/librispeech_test_other/manifest.csv,greedy,0.8,0.0,0.0,0.11219750672207285,0.038127997674531275
+data/librispeech_test_other/manifest.csv,greedy,1.0,0.0,0.0,0.11219750672207285,0.038127997674531275
+data/librispeech_test_other/manifest.csv,greedy,1.2,0.0,0.0,0.11219750672207285,0.038127997674531275
+data/librispeech_test_other/manifest.csv,greedy,1.5,0.0,0.0,0.11219750672207285,0.038127997674531275
+data/librispeech_test_other/manifest.csv,greedy,2.0,0.0,0.0,0.11219750672207285,0.038127997674531275

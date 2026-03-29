@@ -1,0 +1,9 @@
+manifest,method,temperature,alpha,beta,wer,cer
+data/earnings22_test/manifest.csv,beam_lm,0.5,0.1,0.5,0.5518072289156627,0.255352508650519
+data/earnings22_test/manifest.csv,beam_lm,1.0,0.1,0.5,0.5557228915662651,0.2547037197231834
+data/earnings22_test/manifest.csv,beam_lm,1.5,0.1,0.5,0.5659638554216867,0.25578503460207613
+data/earnings22_test/manifest.csv,beam_lm,2.0,0.1,0.5,0.5840361445783132,0.2575151384083045
+data/earnings22_test/manifest.csv,greedy,0.5,0.0,0.0,0.5496987951807228,0.25578503460207613
+data/earnings22_test/manifest.csv,greedy,1.0,0.0,0.0,0.5496987951807228,0.25578503460207613
+data/earnings22_test/manifest.csv,greedy,1.5,0.0,0.0,0.5496987951807228,0.25578503460207613
+data/earnings22_test/manifest.csv,greedy,2.0,0.0,0.0,0.5496987951807228,0.25578503460207613
