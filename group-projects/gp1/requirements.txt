@@ -1,0 +1,5 @@
+torch>=2.0
+soundfile>=0.12
+scipy>=1.10
+jiwer>=3.0
+kenlm>=0.2
